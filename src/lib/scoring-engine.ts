@@ -45,7 +45,7 @@ function calcDevPerformanceScore(product: Product): number {
 
 /** 4-Year Longevity Score (0–100) */
 function calcLongevityScore(product: Product): number {
-  let score = 50; // baseline
+  let score = 25; // baseline so high-longevity specs differentiate without saturating at 100
 
   // Upgradeable RAM is critical for longevity
   if (!product.ram.soldered) score += 20;
@@ -59,19 +59,20 @@ function calcLongevityScore(product: Product): number {
   // CPU architecture generation (Zen 4 / Meteor Lake = most future-proof)
   const arch = product.cpu.architecture.toLowerCase();
   if (arch.includes("zen 4") || arch.includes("meteor lake") || arch.includes("m3")) score += 15;
-  else if (arch.includes("zen 3") || arch.includes("raptor lake")) score += 8;
+  else if (arch.includes("zen 3+") || arch.includes("raptor lake")) score += 11;
+  else if (arch.includes("zen 3")) score += 8;
   else if (arch.includes("zen 2") || arch.includes("alder lake")) score += 3;
 
   // Build quality (MIL-STD)
-  if (product.build.mil_std_810h) score += 10;
+  if (product.build.mil_std_810h) score += 14;
   if (product.build.material === "Aluminum" || product.build.material === "Magnesium Alloy") score += 5;
 
   // Warranty
-  if (product.warranty_years >= 3) score += 10;
+  if (product.warranty_years >= 3) score += 12;
   else if (product.warranty_years >= 2) score += 5;
 
   // Repairability (Framework = maximum)
-  if (product.brand === "Framework") score += 10;
+  if (product.brand === "Framework") score += 6;
 
   // CPU fabrication node (smaller = more efficient, longer relevance)
   if (product.cpu.node_nm <= 4) score += 8;
@@ -212,6 +213,46 @@ export function filterAndEliminate(
       );
     }
 
+    // 8. Preferred Brands filter (when user explicitly restricts brands)
+    if (
+      constraints.preferred_brands &&
+      constraints.preferred_brands.length > 0 &&
+      !constraints.preferred_brands.some(
+        (b) => b.toLowerCase() === product.brand.toLowerCase()
+      )
+    ) {
+      reasons.push(
+        `Brand "${product.brand}" is not in selected manufacturers (${constraints.preferred_brands.join(", ")})`
+      );
+    }
+
+    // 9. Must-have specs filter from Spend Policy drawer
+    if (constraints.must_have_specs && constraints.must_have_specs.length > 0) {
+      for (const spec of constraints.must_have_specs) {
+        if (spec === "Upgradeable RAM" && product.ram.soldered) {
+          reasons.push(`Soldered RAM fails required "Upgradeable RAM" policy`);
+        } else if (spec === "MIL-STD-810H" && !product.build.mil_std_810h) {
+          reasons.push(`Lacks MIL-STD-810H durability certification`);
+        } else if (spec === "DDR5 RAM" && product.ram.type !== "DDR5" && product.ram.type !== "LPDDR5X") {
+          reasons.push(`Memory type ${product.ram.type} does not meet DDR5 requirement`);
+        } else if (spec === "NVMe Gen4 SSD" && !product.storage.type.includes("Gen4")) {
+          reasons.push(`Storage ${product.storage.type} is slower than required NVMe Gen4 SSD`);
+        } else if (
+          spec === "Thunderbolt 4" &&
+          !product.build.ports.some((pt) => pt.toLowerCase().includes("thunderbolt") || pt.toLowerCase().includes("tbt4"))
+        ) {
+          reasons.push(`Missing Thunderbolt 4 port`);
+        } else if (spec === "Fast Charging" && !product.battery.fast_charge) {
+          reasons.push(`Lacks fast charging support`);
+        } else if (
+          spec === "Linux Compatible" &&
+          product.os.toLowerCase().includes("chromeos")
+        ) {
+          reasons.push(`ChromeOS does not meet Linux compatibility requirement`);
+        }
+      }
+    }
+
     if (reasons.length > 0) {
       eliminated.push({
         product: { ...product, eliminated: true, elimination_reason: reasons[0] },
@@ -338,3 +379,4 @@ export const GPU_SCORING_HINT = {
   parallelizable: true,
   note: "scoreProduct() and calcDevPerformanceScore() are pure math — GPU-offloadable via WebGL",
 };
+

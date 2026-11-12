@@ -1177,3 +1177,4 @@ export const CATALOG_BY_SKU = new Map<string, Product>(
 export const SCENARIO_1_TOP_PICK_SKU = "LENOVO-TPE14G6-AMD-16-512";
 export const SCENARIO_2_FIREWALL_SKU = "APPLE-MBP14-M3-8GB-512";
 export const SCENARIO_3_TOP_PICK_SKU = "ASUS-PROART-16-R9-32-1TB";
+

@@ -286,3 +286,4 @@ function createSimulatedCapture(
     simulation_mode: true,
   };
 }
+

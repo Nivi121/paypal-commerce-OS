@@ -14,6 +14,7 @@ export interface ShoppingConstraints {
   mil_std?: boolean;
   upgradeable_ram?: boolean;
   preferred_brands?: string[];
+  must_have_specs?: string[];
   longevity_years?: number;
   min_storage_gb?: number;
   gpu_required?: boolean;
@@ -255,3 +256,4 @@ export interface SpendFirewallResult {
 }
 
 export type WorkspaceTab = "recommendation" | "grid" | "audit";
+

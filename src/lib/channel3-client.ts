@@ -162,8 +162,7 @@ export async function hybridSearch(
     return (
       p.category.toLowerCase().includes(categoryFilter.toLowerCase()) ||
       p.name.toLowerCase().includes(q) ||
-      p.brand.toLowerCase().includes(q) ||
-      p.use_case_tags?.some((t: string) => q.includes(t))
+      p.brand.toLowerCase().includes(q)
     );
   }).slice(0, maxResults);
 
@@ -183,3 +182,4 @@ export async function hybridSearch(
     channel3Live: source === "live",
   };
 }
+

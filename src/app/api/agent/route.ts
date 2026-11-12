@@ -6,8 +6,15 @@
 // ============================================================
 
 import { NextRequest, NextResponse } from "next/server";
-import { CATALOG_PRODUCTS, SCENARIO_1_TOP_PICK_SKU, SCENARIO_2_FIREWALL_SKU, SCENARIO_3_TOP_PICK_SKU } from "@/lib/catalog-data";
-import { filterAndEliminate, rankProducts, buildCheckoutIntent } from "@/lib/scoring-engine";
+import {
+  CATALOG_PRODUCTS,
+  SCENARIO_2_FIREWALL_SKU,
+} from "@/lib/catalog-data";
+import {
+  filterAndEliminate,
+  rankProducts,
+  buildCheckoutIntent,
+} from "@/lib/scoring-engine";
 import { hybridSearch } from "@/lib/channel3-client";
 import type {
   AgentSession,
@@ -15,6 +22,7 @@ import type {
   ShoppingConstraints,
   Product,
   UserPreferences,
+  AuditLogEntry,
 } from "@/types/commerce";
 import crypto from "crypto";
 
@@ -22,88 +30,175 @@ export const runtime = "nodejs";
 export const maxDuration = 30;
 
 // ─── Tool definitions for LLM tool calling ───────────────────
-const AGENT_TOOLS = [
+const AGENT_TOOL_DECLARATIONS = [
   {
     name: "extract_shopping_constraints",
-    description: "Parse a natural language shopping goal into structured hard constraints and derived engineering specs for longevity.",
+    description:
+      "Parse a natural language shopping goal into structured hard constraints and derived engineering specs for longevity.",
     parameters: {
       type: "object",
       properties: {
         max_price_usd: { type: "number", description: "Maximum budget in USD" },
         min_ram_gb: { type: "number", description: "Minimum RAM in GB" },
         category: { type: "string", description: "Product category (laptop, desktop, etc.)" },
-        use_case: { type: "string", description: "Primary use case (programming, gaming, etc.)" },
+        use_case: { type: "string", description: "Primary use case (programming, ai_inference, etc.)" },
         min_battery_wh: { type: "number", description: "Minimum battery capacity in Wh for longevity" },
         longevity_years: { type: "number", description: "Expected device lifetime in years" },
-        preferred_brands: { type: "array", items: { type: "string" }, description: "Preferred brands if mentioned" },
+        preferred_brands: { type: "array", items: { type: "string" }, description: "Preferred brands" },
       },
       required: ["max_price_usd", "min_ram_gb", "category", "use_case"],
     },
   },
   {
     name: "search_products",
-    description: "Search for products matching constraints from Channel3 API and authorized sandbox catalog.",
+    description:
+      "Search for products matching constraints from Channel3 API and authorized sandbox catalog.",
     parameters: {
       type: "object",
       properties: {
         query: { type: "string", description: "Search query" },
         category: { type: "string" },
-        max_results: { type: "number", default: 10 },
+        max_results: { type: "number" },
       },
       required: ["query", "category"],
     },
   },
   {
     name: "compare_products",
-    description: "Filter and eliminate products that violate hard constraints or derived longevity rules.",
+    description:
+      "Filter, eliminate traps, and quantitatively rank surviving products using Fit Score.",
     parameters: {
       type: "object",
       properties: {
-        product_ids: { type: "array", items: { type: "string" } },
-        constraints: { type: "object" },
+        max_price_usd: { type: "number" },
+        min_ram_gb: { type: "number" },
+        longevity_years: { type: "number" },
       },
-      required: ["product_ids", "constraints"],
+      required: ["max_price_usd", "min_ram_gb"],
     },
   },
   {
     name: "draft_checkout_intent",
-    description: "Create a checkout intent for the top-ranked product. Runs deterministic spend firewall check. NOTE: This tool CANNOT capture funds — only humans can authorize payment.",
+    description:
+      "Create a checkout intent for a product SKU. Runs deterministic spend firewall check. Cannot capture funds.",
     parameters: {
       type: "object",
       properties: {
-        product_id: { type: "string" },
+        product_sku: { type: "string" },
         budget_cap: { type: "number" },
-        session_id: { type: "string" },
       },
-      required: ["product_id", "budget_cap", "session_id"],
+      required: ["product_sku", "budget_cap"],
     },
   },
 ];
+
+// ─── Optional Live LLM Constraint Extraction (Gemini / OpenAI) ─
+async function tryLiveLLMConstraintParse(
+  goal: string
+): Promise<{ constraints: Partial<ShoppingConstraints>; provider: "gemini" | "openai" } | null> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  if (geminiKey) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: goal }] }],
+            tools: [{ functionDeclarations: [AGENT_TOOL_DECLARATIONS[0]] }],
+            toolConfig: {
+              functionCallingConfig: {
+                mode: "ANY",
+                allowedFunctionNames: ["extract_shopping_constraints"],
+              },
+            },
+          }),
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const call = data?.candidates?.[0]?.content?.parts?.[0]?.functionCall;
+        if (call?.args) {
+          return { constraints: call.args as Partial<ShoppingConstraints>, provider: "gemini" };
+        }
+      }
+    } catch (e) {
+      console.warn("[Gemini] Falling back to deterministic parser:", e);
+    }
+  }
+
+  if (openaiKey) {
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${openaiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "Extract structured shopping constraints using the tool." },
+            { role: "user", content: goal },
+          ],
+          tools: [{ type: "function", function: AGENT_TOOL_DECLARATIONS[0] }],
+          tool_choice: { type: "function", function: { name: "extract_shopping_constraints" } },
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const argsStr = data?.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+        if (argsStr) {
+          return {
+            constraints: JSON.parse(argsStr) as Partial<ShoppingConstraints>,
+            provider: "openai",
+          };
+        }
+      }
+    } catch (e) {
+      console.warn("[OpenAI] Falling back to deterministic parser:", e);
+    }
+  }
+
+  return null;
+}
 
 // ─── Deterministic Constraint Parsing ────────────────────────
 
 function parseConstraintsDeterministic(goal: string): ShoppingConstraints {
   const g = goal.toLowerCase();
 
-  // Extract price
-  const priceMatch = g.match(/\$?(\d{3,4})(?:\s*\.00)?(?:\s*(?:budget|cap|max|limit|under|below|less than))?/);
-  const max_price_usd = priceMatch ? parseInt(priceMatch[1]) : 900;
+  // Extract budget cap specifically if "budget cap is $900" or "under $900"
+  const capMatch =
+    g.match(/(?:budget(?:\s+cap)?\s*(?:is|of)?\s*|under\s+|below\s+|less than\s+)\$?([\d,]+)/i) ||
+    g.match(/\$?([\d,]{3,4})(?:\s*\.00)?/);
 
-  // Extract RAM
-  const ramMatch = g.match(/(\d+)\s*gb\s*(?:ram|memory)/);
-  const min_ram_gb = ramMatch ? parseInt(ramMatch[1]) : 16;
+  const rawPrice = capMatch ? parseInt(capMatch[1].replace(/,/g, ""), 10) : 900;
+  const max_price_usd = rawPrice >= 300 && rawPrice <= 5000 ? rawPrice : 900;
 
-  // Longevity
-  const longevityMatch = g.match(/(\d+)\s*(?:years?|yr)/);
-  const longevity_years = longevityMatch ? parseInt(longevityMatch[1]) : 4;
+  const ramMatch = g.match(/(\d+)\s*gb\s*(?:ram|memory)?/i);
+  const min_ram_gb = ramMatch ? parseInt(ramMatch[1], 10) : 16;
 
-  // Use case
-  let use_case = "general";
-  if (g.includes("programming") || g.includes("coding") || g.includes("developer") || g.includes("dev")) use_case = "programming";
-  else if (g.includes("gaming") || g.includes("game")) use_case = "gaming";
-  else if (g.includes("video") || g.includes("editing") || g.includes("creator")) use_case = "creative";
-  else if (g.includes("llm") || g.includes("ai") || g.includes("machine learning") || g.includes("inference")) use_case = "ai_inference";
-  else if (g.includes("docker") || g.includes("container") || g.includes("workstation")) use_case = "workstation";
+  const longevityMatch = g.match(/(\d+|four|five|three)\s*(?:years?|yr)/i);
+  let longevity_years = 4;
+  if (longevityMatch) {
+    const val = longevityMatch[1].toLowerCase();
+    longevity_years = val === "four" ? 4 : val === "five" ? 5 : val === "three" ? 3 : parseInt(val, 10) || 4;
+  }
+
+  let use_case = "programming";
+  if (g.includes("llm") || g.includes("inference") || g.includes("ai") || g.includes("docker")) {
+    use_case = "ai_inference";
+  } else if (g.includes("programming") || g.includes("coding") || g.includes("dev")) {
+    use_case = "programming";
+  } else if (g.includes("gaming")) {
+    use_case = "gaming";
+  }
 
   return {
     max_price_usd,
@@ -116,16 +211,23 @@ function parseConstraintsDeterministic(goal: string): ShoppingConstraints {
   };
 }
 
-// ─── Deterministic Scenario Detection ────────────────────────
-
 function detectScenario(goal: string): 1 | 2 | 3 {
   const g = goal.toLowerCase();
-  if (g.includes("macbook") || g.includes("force buy") || g.includes("1,299") || g.includes("1299")) return 2;
-  if (g.includes("32gb") || g.includes("llm") || g.includes("inference") || g.includes("docker") || g.includes("1,150") || g.includes("1150")) return 3;
+  if (g.includes("macbook") || g.includes("force buy") || g.includes("1,299") || g.includes("1299")) {
+    return 2;
+  }
+  if (
+    g.includes("32gb") ||
+    g.includes("llm") ||
+    g.includes("inference") ||
+    g.includes("docker") ||
+    g.includes("1,150") ||
+    g.includes("1150")
+  ) {
+    return 3;
+  }
   return 1;
 }
-
-// ─── Build Step Helper ────────────────────────────────────────
 
 function makeStep(
   step: number,
@@ -140,39 +242,89 @@ function makeStep(
     description,
     status,
     timestamp: new Date().toISOString(),
-    latency_ms: Math.floor(Math.random() * 300) + 150,
+    latency_ms: extras.latency_ms ?? Math.floor(Math.random() * 140) + 80,
     ...extras,
   };
 }
 
-// ─── Main Deterministic Agent Orchestrator ────────────────────
+// ─── Main Agent Orchestrator ──────────────────────────────────
 
-async function runDeterministicAgent(
+async function runAgentOrchestrator(
   goal: string,
   sessionId: string,
-  preferences?: Partial<UserPreferences>
+  preferences?: Partial<UserPreferences>,
+  applyPreferences = false
 ): Promise<AgentSession> {
   const scenario = detectScenario(goal);
   const steps: AgentStep[] = [];
-  const auditLog = [];
+  const auditLog: AuditLogEntry[] = [];
 
-  await new Promise((r) => setTimeout(r, 50));
+  // ── STEP 1: Semantic Constraint Parsing (Live LLM or Deterministic) ──
+  const t1 = Date.now();
+  const baseConstraints = parseConstraintsDeterministic(goal);
+  const llmResult = await tryLiveLLMConstraintParse(goal);
 
-  // ── STEP 1: Constraint Parsing ──────────────────────────────
-  const constraints = parseConstraintsDeterministic(goal);
-  if (preferences?.budget_cap) constraints.max_price_usd = preferences.budget_cap;
-  if (preferences?.min_ram_gb) constraints.min_ram_gb = preferences.min_ram_gb;
+  const constraints: ShoppingConstraints = {
+    ...baseConstraints,
+    ...(llmResult?.constraints || {}),
+  };
 
-  steps.push(makeStep(
-    1,
-    "Semantic Constraint Parsing & Persistent Memory",
-    `Extracted: Budget $${constraints.max_price_usd}, Min RAM ${constraints.min_ram_gb}GB, Use Case: ${constraints.use_case}, Longevity: ${constraints.longevity_years || 4} years → derived battery ≥${constraints.min_battery_wh}Wh, upgradeable RAM required, DDR5 preferred`,
-    "completed",
-    { tool: "extract_shopping_constraints", tool_calls: [{ tool: "extract_shopping_constraints", input: { goal }, output: constraints, latency_ms: 180, timestamp: new Date().toISOString() }] }
-  ));
+  // Apply Spend Policy drawer overrides cleanly
+  if (scenario === 2) {
+    constraints.max_price_usd = preferences?.budget_cap ?? 900;
+  } else if (applyPreferences && preferences) {
+    if (preferences.budget_cap !== undefined) constraints.max_price_usd = preferences.budget_cap;
+    if (preferences.min_ram_gb !== undefined) constraints.min_ram_gb = preferences.min_ram_gb;
+    if (preferences.longevity_years !== undefined) {
+      constraints.longevity_years = preferences.longevity_years;
+      constraints.min_battery_wh = preferences.longevity_years >= 4 ? 50 : 40;
+    }
+    if (preferences.use_case) constraints.use_case = preferences.use_case;
+  } else {
+    if (preferences?.budget_cap && !goal.match(/\$\d+/)) {
+      constraints.max_price_usd = preferences.budget_cap;
+    }
+    if (preferences?.min_ram_gb && !goal.match(/\d+\s*gb/i)) {
+      constraints.min_ram_gb = preferences.min_ram_gb;
+    }
+  }
 
-  // ── STEP 2: Product Discovery ───────────────────────────────
-  let allProducts: Product[];
+  // Always carry over brand & must-have spec filters when set in Spend Policy
+  if (preferences?.preferred_brands && preferences.preferred_brands.length > 0) {
+    constraints.preferred_brands = preferences.preferred_brands;
+  }
+  if (preferences?.must_have_specs && preferences.must_have_specs.length > 0) {
+    constraints.must_have_specs = preferences.must_have_specs;
+  }
+
+  const mode = llmResult ? "live_llm" : "deterministic_fallback";
+  const llmProvider = llmResult?.provider;
+
+  steps.push(
+    makeStep(
+      1,
+      "Semantic Constraint Parsing & Persistent Memory",
+      `[${llmProvider ? `Live ${llmProvider.toUpperCase()} Tool Call` : "Deterministic Parser"}] Budget Cap: $${constraints.max_price_usd} | Min RAM: ${constraints.min_ram_gb}GB | Use Case: ${constraints.use_case} | Longevity: ${constraints.longevity_years || 4} yrs → derived battery ≥${constraints.min_battery_wh}Wh, upgradeable DDR5 preferred`,
+      "completed",
+      {
+        tool: "extract_shopping_constraints",
+        latency_ms: Math.max(Date.now() - t1, 45),
+        tool_calls: [
+          {
+            tool: "extract_shopping_constraints",
+            input: { goal },
+            output: { ...constraints } as Record<string, unknown>,
+            latency_ms: Math.max(Date.now() - t1, 45),
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      }
+    )
+  );
+
+  // ── STEP 2: Hybrid Catalogue Discovery ─────────────────────
+  const t2 = Date.now();
+  let allProducts: Product[] = CATALOG_PRODUCTS;
   let channel3Live = false;
 
   try {
@@ -181,97 +333,146 @@ async function runDeterministicAgent(
       "laptop",
       15
     );
-    allProducts = products.length > 0 ? products : CATALOG_PRODUCTS;
+    if (products.length > 0) allProducts = products;
     channel3Live = live;
   } catch {
     allProducts = CATALOG_PRODUCTS;
   }
 
-  steps.push(makeStep(
-    2,
-    "Hybrid Catalogue Discovery",
-    `Found ${allProducts.length} candidates from ${channel3Live ? "Channel3 API (live) + Catalog" : "Authorized Sandbox Catalog"}. Includes strategic traps: Gaming laptop with 2.5h battery, $749 laptop with soldered 8GB RAM, $1,299 over-budget MacBook Pro.`,
-    "completed",
-    { tool: "search_products", products_found: allProducts.length }
-  ));
+  steps.push(
+    makeStep(
+      2,
+      "Hybrid Catalogue Discovery",
+      `Queried ${channel3Live ? "Channel3 Live API + Authorized Sandbox Catalog" : "Authorized Sandbox Catalog"} (${allProducts.length} laptops loaded, including soldered-RAM, 41Wh gaming, and over-budget traps).`,
+      "completed",
+      {
+        tool: "search_products",
+        products_found: allProducts.length,
+        latency_ms: Math.max(Date.now() - t2, 60),
+      }
+    )
+  );
 
-  // ── STEP 3: Eliminate non-qualifying products ───────────────
+  // ── STEP 3: Spec, Price & Review Elimination ───────────────
   const { passed, eliminated } = filterAndEliminate(allProducts, constraints);
 
-  steps.push(makeStep(
-    3,
-    "Spec, Price & Review Elimination",
-    `Eliminated ${eliminated.length} products for violating hard constraints or derived longevity rules. ${passed.length} candidates pass all filters.`,
-    "completed",
-    {
-      tool: "compare_products",
-      products_found: allProducts.length,
-      products_eliminated: eliminated.length,
-    }
-  ));
+  steps.push(
+    makeStep(
+      3,
+      "Spec, Price & Review Elimination",
+      `Eliminated ${eliminated.length} disqualifying models (soldered RAM, weak 41-42Wh batteries, ChromeOS, over-budget). ${passed.length} verified candidates survive.`,
+      "completed",
+      {
+        tool: "compare_products",
+        products_found: allProducts.length,
+        products_eliminated: eliminated.length,
+      }
+    )
+  );
 
-  // ── STEP 4: Multi-Axis Ranking ──────────────────────────────
+  // ── STEP 4: Quantitative Multi-Axis Ranking ────────────────
   const ranked = rankProducts(passed, constraints.max_price_usd);
 
-  steps.push(makeStep(
-    4,
-    "Quantitative Multi-Axis Ranking (Agentic Fit Score)",
-    `Scored ${ranked.length} survivors using: DevPerf×0.35 + Longevity×0.30 + Battery×0.20 + PriceDelta×0.15. #1: ${ranked[0]?.name || "N/A"} with FitScore ${ranked[0]?.fit_score?.toFixed(1) || "N/A"}/100`,
-    "completed",
-    { tool: "rank_products", products_ranked: ranked.length }
-  ));
-
-  // ── STEP 5: Top Recommendation ──────────────────────────────
-  const topPick = ranked[0] || null;
-
-  steps.push(makeStep(
-    5,
-    "Explainable Top Recommendation",
-    topPick
-      ? `#1 Winner: ${topPick.name} at $${topPick.price_usd.toFixed(2)} — FitScore ${topPick.fit_score?.toFixed(1)}/100. ${topPick.ram.soldered ? "⚠ Soldered RAM" : "✓ Upgradeable RAM"}, ${topPick.battery.capacity_wh}Wh battery, ${topPick.build.mil_std_810h ? "MIL-STD-810H" : "standard"} chassis. ${ranked[1] ? `Beat #2 ${ranked[1].name} ($${ranked[1].price_usd}) by ${((topPick.fit_score || 0) - (ranked[1].fit_score || 0)).toFixed(1)} points.` : ""}`
-      : "No qualifying products found",
-    topPick ? "completed" : "error"
-  ));
-
-  // ── STEP 6: Checkout Intent ─────────────────────────────────
-  let checkoutIntent = null;
-
-  if (topPick) {
-    checkoutIntent = buildCheckoutIntent(topPick, constraints, sessionId);
-
-    steps.push(makeStep(
-      6,
-      "Itemized Checkout Presentation",
-      `Item: $${checkoutIntent.item_price.toFixed(2)} | Shipping: $0.00 | Tax: $0.00 | Total: $${checkoutIntent.total.toFixed(2)} | ${checkoutIntent.budget_savings >= 0 ? `✓ $${checkoutIntent.budget_savings.toFixed(2)} saved under budget` : `⚠ $${Math.abs(checkoutIntent.budget_savings).toFixed(2)} over budget`}`,
+  steps.push(
+    makeStep(
+      4,
+      "Quantitative Multi-Axis Ranking (Agentic Fit Score)",
+      `Scored ${ranked.length} survivors: FitScore = 0.35×DevPerf + 0.30×Longevity + 0.20×Battery + 0.15×BudgetDelta. #1: ${ranked[0]?.name || "N/A"} (${ranked[0]?.fit_score?.toFixed(1) || "N/A"}/100).`,
       "completed",
-      { tool: "draft_checkout_intent" }
-    ));
+      {
+        tool: "rank_products",
+        products_ranked: ranked.length,
+      }
+    )
+  );
 
-    // ── STEP 7: HITL Approval Gate ────────────────────────────
-    const firewallStatus = checkoutIntent.spend_firewall_status;
+  // ── STEP 5: Top Recommendation (or Forced Target for Scenario 2) ──
+  const forcedMacBook =
+    scenario === 2
+      ? allProducts.find((p) => p.sku === SCENARIO_2_FIREWALL_SKU) || null
+      : null;
 
-    steps.push(makeStep(
-      7,
-      "Human-in-the-Loop (HITL) Approval & Spend Firewall",
-      firewallStatus === "APPROVED"
-        ? `✅ SPEND_FIREWALL_APPROVED | Budget Cap: $${constraints.max_price_usd} | Verified Price: $${checkoutIntent.total.toFixed(2)} | SHA-256 Lock: ${checkoutIntent.sha256_lock.slice(0, 16)}... | Status: Awaiting Human Signature`
-        : `🚫 ${checkoutIntent.spend_firewall_message}`,
-      firewallStatus === "APPROVED" ? "completed" : "blocked",
-      { tool: "spend_firewall_check" }
-    ));
+  const targetProduct = forcedMacBook || ranked[0] || null;
 
-    // ── STEP 8: PayPal (pending human action) ─────────────────
-    steps.push(makeStep(
-      8,
-      "PayPal Sandbox Checkout & Cryptographic Verification",
-      firewallStatus === "APPROVED"
-        ? "⏳ Awaiting human authorization. Click 'Approve & Pay via PayPal' or '1-Click Sandbox Express Approve' to complete checkout."
-        : `🚫 PayPal order creation blocked by Spend Firewall: ${checkoutIntent.spend_firewall_message}`,
-      firewallStatus === "APPROVED" ? "pending" : "blocked"
-    ));
+  if (scenario === 2 && forcedMacBook) {
+    steps.push(
+      makeStep(
+        5,
+        "Forced Purchase Target Identified",
+        `User explicitly requested forced checkout of ${forcedMacBook.name} ($${forcedMacBook.price_usd.toFixed(2)}) against authorized budget cap of $${constraints.max_price_usd.toFixed(2)}. Forwarding to Spend Firewall check...`,
+        "completed"
+      )
+    );
+  } else {
+    steps.push(
+      makeStep(
+        5,
+        "Explainable Top Recommendation",
+        targetProduct
+          ? `#1 Winner: ${targetProduct.name} at $${targetProduct.price_usd.toFixed(2)} — FitScore ${targetProduct.fit_score?.toFixed(1)}/100. ${targetProduct.ram.soldered ? "Soldered RAM" : `Upgradeable DDR5 up to ${targetProduct.ram.max_upgradeable_gb}GB`}, ${targetProduct.battery.capacity_wh}Wh battery (${targetProduct.battery.rated_hours}h), ${targetProduct.build.mil_std_810h ? "MIL-STD-810H aluminum chassis" : targetProduct.build.material}.${ranked[1] ? ` Beat #2 ${ranked[1].model} ($${ranked[1].price_usd}) by ${((targetProduct.fit_score || 0) - (ranked[1].fit_score || 0)).toFixed(1)} pts.` : ""}`
+          : "No qualifying products found",
+        targetProduct ? "completed" : "error"
+      )
+    );
   }
 
-  const session: AgentSession = {
+  // ── STEP 6 & 7: Checkout Intent + Spend Firewall ───────────
+  let checkoutIntent = null;
+
+  if (targetProduct) {
+    checkoutIntent = buildCheckoutIntent(targetProduct, constraints, sessionId);
+
+    steps.push(
+      makeStep(
+        6,
+        "Itemized Checkout Presentation",
+        `Item: $${checkoutIntent.item_price.toFixed(2)} | Shipping: $0.00 | Tax: $0.00 | Total: $${checkoutIntent.total.toFixed(2)} USD (${checkoutIntent.budget_savings >= 0 ? `$${checkoutIntent.budget_savings.toFixed(2)} saved under $${constraints.max_price_usd} budget` : `$${Math.abs(checkoutIntent.budget_savings).toFixed(2)} OVER $${constraints.max_price_usd} budget cap`})`,
+        "completed",
+        { tool: "draft_checkout_intent" }
+      )
+    );
+
+    const firewallApproved = checkoutIntent.spend_firewall_status === "APPROVED";
+
+    auditLog.push({
+      id: crypto.randomUUID(),
+      event_type: "SPEND_FIREWALL",
+      timestamp: checkoutIntent.created_at,
+      sha256_hash: checkoutIntent.sha256_lock,
+      data: {
+        status: checkoutIntent.spend_firewall_status,
+        sku: targetProduct.sku,
+        price_usd: checkoutIntent.item_price,
+        budget_cap_usd: checkoutIntent.budget_cap,
+        message: checkoutIntent.spend_firewall_message,
+      },
+    });
+
+    steps.push(
+      makeStep(
+        7,
+        "Human-in-the-Loop (HITL) Approval & Spend Firewall",
+        firewallApproved
+          ? `SPEND_FIREWALL_APPROVED | Budget Cap: $${constraints.max_price_usd} | Verified Price: $${checkoutIntent.total.toFixed(2)} | SHA-256 Lock: ${checkoutIntent.sha256_lock.slice(0, 16)}... | Awaiting Human Signature`
+          : `${checkoutIntent.spend_firewall_message}`,
+        firewallApproved ? "completed" : "blocked",
+        { tool: "spend_firewall_check" }
+      )
+    );
+
+    steps.push(
+      makeStep(
+        8,
+        "PayPal Sandbox Checkout & Cryptographic Verification",
+        firewallApproved
+          ? "Awaiting human signature. Click '1-Click Sandbox Express Approve' or use the PayPal Smart Button to capture funds."
+          : `BLOCKED: PayPal order creation refused by Deterministic Spend Firewall ($${checkoutIntent.item_price.toFixed(2)} > $${constraints.max_price_usd.toFixed(2)}).`,
+        firewallApproved ? "pending" : "blocked"
+      )
+    );
+  }
+
+  return {
     session_id: sessionId,
     scenario,
     goal,
@@ -280,25 +481,25 @@ async function runDeterministicAgent(
     candidates: allProducts,
     eliminated: eliminated.map((e) => e.product),
     ranked,
-    top_pick: topPick,
+    top_pick: targetProduct,
     checkout_intent: checkoutIntent,
     capture_receipt: null,
     audit_log: auditLog,
     created_at: new Date().toISOString(),
-    mode: "deterministic_fallback",
+    mode,
+    llm_provider: llmProvider,
   };
-
-  return session;
 }
 
 // ─── POST Handler ─────────────────────────────────────────────
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
   try {
-    const body = await req.json() as {
+    const body = (await req.json()) as {
       goal: string;
       session_id?: string;
       preferences?: Partial<UserPreferences>;
+      apply_preferences?: boolean;
     };
 
     if (!body.goal || typeof body.goal !== "string") {
@@ -306,7 +507,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     const sessionId = body.session_id || crypto.randomUUID();
-    const session = await runDeterministicAgent(body.goal, sessionId, body.preferences);
+    const session = await runAgentOrchestrator(
+      body.goal,
+      sessionId,
+      body.preferences,
+      Boolean(body.apply_preferences)
+    );
 
     return NextResponse.json(session, {
       headers: {
